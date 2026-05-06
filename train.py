@@ -87,9 +87,6 @@ pipe.unet.to(device)
 pipe.vae.to(device)
 pipe.text_encoder.to(device)
 
-# =========================
-# CARGAR DATASET
-# =========================
 print("Cargando dataset Flickr8k...")
 raw_dataset = load_dataset("jxie/flickr8k", split="train")
 
@@ -98,7 +95,6 @@ if max_samples:
 
 print(f"Muestras a usar: {len(raw_dataset)}")
 
-# Detectar columnas de caption automáticamente
 sample_keys = list(raw_dataset[0].keys())
 print(f"Columnas del dataset: {sample_keys}")
 caption_cols = [c for c in sample_keys if c.startswith("caption")]
@@ -117,16 +113,10 @@ dataloader = DataLoader(
     pin_memory=(device == "cuda"),
 )
 
-# =========================
-# OPTIMIZADOR Y SCALER
-# =========================
 optimizer = torch.optim.AdamW(pipe.unet.parameters(), lr=lr, weight_decay=1e-2)
 use_amp = device == "cuda"
 scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
-# =========================
-# ENTRENAMIENTO
-# =========================
 pipe.unet.train()
 
 for epoch in range(epochs):
@@ -179,9 +169,6 @@ for epoch in range(epochs):
     avg_loss = total_loss / len(dataloader)
     print(f"Loss promedio epoch {epoch+1}: {avg_loss:.4f}")
 
-# =========================
-# GUARDAR MODELO
-# =========================
 os.makedirs(output_dir, exist_ok=True)
 pipe.unet.save_pretrained(output_dir)
 print(f"\nModelo guardado en: {output_dir}")
