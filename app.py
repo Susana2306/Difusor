@@ -1,47 +1,105 @@
 import os
 import base64
+import time
 from io import BytesIO
 
 import torch
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers import (
+    StableDiffusionPipeline,
+    DPMSolverMultistepScheduler,
+    PixArtAlphaPipeline,
+)
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from peft import PeftModel
+from PIL import Image
 from pydantic import BaseModel
 
-app = FastAPI(title="Generador de Imágenes")
+# Suppress the Windows symlinks warning (cosmetic, no impact on functionality)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+app = FastAPI(title="Comparador de Modelos")
 templates = Jinja2Templates(directory="templates")
 
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
-model_id = "runwayml/stable-diffusion-v1-5"
-lora_dir = "lora_model"
+dtype  = torch.float16 if device == "cuda" else torch.float32
+print(f"Device: {device}")
 
-print(f"Cargando pipeline en {device}...")
-pipe = StableDiffusionPipeline.from_pretrained(
-    model_id,
-    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+# ── Stable Diffusion 1.5 + LoRA ──────────────────────────────────────────────
+SD_MODEL_ID = "runwayml/stable-diffusion-v1-5"
+SD_LORA_DIR = "lora_model"
+
+print("[SD] Cargando pipeline...")
+pipe_sd = StableDiffusionPipeline.from_pretrained(
+    SD_MODEL_ID,
+    torch_dtype=dtype,
     safety_checker=None,
     requires_safety_checker=False,
-).to(device)
+)
 
-if os.path.exists(lora_dir):
-    pipe.unet = PeftModel.from_pretrained(pipe.unet, lora_dir)
-    pipe.unet.eval()
-    print("LoRA fine-tuning cargado.")
+if os.path.exists(SD_LORA_DIR):
+    pipe_sd.unet = PeftModel.from_pretrained(pipe_sd.unet, SD_LORA_DIR)
+    pipe_sd.unet.eval()
+    print("[SD] LoRA cargado.")
 else:
-    print("Sin LoRA — usando modelo base.")
+    print("[SD] Sin LoRA — modelo base.")
 
-pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-pipe.enable_attention_slicing()
-print("Pipeline listo.")
+pipe_sd.scheduler = DPMSolverMultistepScheduler.from_config(pipe_sd.scheduler.config)
+pipe_sd.enable_attention_slicing()
+if device == "cuda":
+    pipe_sd.enable_sequential_cpu_offload()
+else:
+    pipe_sd.to(device)
+print("[SD] Pipeline listo.")
 
 
+# ── PixArt-alpha DiT + LoRA (lazy: se carga en el primer request) ─────────────
+PIXART_MODEL_ID = "PixArt-alpha/PixArt-XL-2-512x512"
+PIXART_LORA_DIR = "pixart_lora/lora_transformer"
+pipe_pixart = None   # se inicializa al primer uso
+_pixart_loading = False
+
+
+def _load_pixart():
+    global pipe_pixart, _pixart_loading
+    if pipe_pixart is not None:
+        return
+    _pixart_loading = True
+    print("[PixArt] Cargando pipeline (primera vez, puede tardar)...")
+    pipe = PixArtAlphaPipeline.from_pretrained(
+        PIXART_MODEL_ID,
+        torch_dtype=dtype,
+    )
+    if os.path.exists(PIXART_LORA_DIR):
+        pipe.transformer = PeftModel.from_pretrained(pipe.transformer, PIXART_LORA_DIR)
+        pipe.transformer.eval()
+        print("[PixArt] LoRA cargado.")
+    else:
+        print("[PixArt] Sin LoRA — modelo base.")
+    if device == "cuda":
+        pipe.enable_sequential_cpu_offload()
+    else:
+        pipe.to(device)
+    pipe_pixart = pipe
+    _pixart_loading = False
+    print("[PixArt] Pipeline listo.")
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _encode(image: Image.Image) -> str:
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+# ── Rutas ─────────────────────────────────────────────────────────────────────
 class GenerateRequest(BaseModel):
     prompt: str
-    steps: int = 15
-    guidance_scale: float = 7.5
+    sd_steps: int = 15
+    sd_guidance: float = 7.5
+    pixart_steps: int = 20
+    pixart_guidance: float = 4.5
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -53,23 +111,49 @@ async def index(request: Request):
 async def generate(body: GenerateRequest):
     if not body.prompt.strip():
         return JSONResponse({"error": "El prompt no puede estar vacío."}, status_code=400)
-
-    steps = max(5, min(body.steps, 50))
-    guidance = max(1.0, min(body.guidance_scale, 20.0))
-
+    steps    = max(5, min(body.sd_steps, 50))
+    guidance = max(1.0, min(body.sd_guidance, 20.0))
     with torch.no_grad():
-        result = pipe(
+        img = pipe_sd(body.prompt, num_inference_steps=steps, guidance_scale=guidance).images[0]
+    return JSONResponse({"image": _encode(img)})
+
+
+@app.post("/compare")
+async def compare(body: GenerateRequest):
+    if not body.prompt.strip():
+        return JSONResponse({"error": "El prompt no puede estar vacío."}, status_code=400)
+
+    _load_pixart()  # no-op si ya está cargado
+
+    sd_steps        = max(5,   min(body.sd_steps,        50))
+    sd_guidance     = max(1.0, min(body.sd_guidance,     20.0))
+    pixart_steps    = max(5,   min(body.pixart_steps,    30))
+    pixart_guidance = max(1.0, min(body.pixart_guidance, 10.0))
+
+    t0 = time.time()
+    with torch.no_grad():
+        img_sd = pipe_sd(
             body.prompt,
-            num_inference_steps=steps,
-            guidance_scale=guidance,
-        )
-    image = result.images[0]
+            num_inference_steps=sd_steps,
+            guidance_scale=sd_guidance,
+        ).images[0]
+    sd_time = round(time.time() - t0, 1)
 
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    img_b64 = base64.b64encode(buffer.getvalue()).decode()
+    t1 = time.time()
+    with torch.no_grad():
+        img_pixart = pipe_pixart(
+            body.prompt,
+            num_inference_steps=pixart_steps,
+            guidance_scale=pixart_guidance,
+        ).images[0]
+    pixart_time = round(time.time() - t1, 1)
 
-    return JSONResponse({"image": img_b64})
+    return JSONResponse({
+        "image_sd":     _encode(img_sd),
+        "image_pixart": _encode(img_pixart),
+        "sd_time":      sd_time,
+        "pixart_time":  pixart_time,
+    })
 
 
 if __name__ == "__main__":
