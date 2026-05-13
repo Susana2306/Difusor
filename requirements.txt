@@ -11,3 +11,6 @@ jinja2>=3.1.0
 pillow>=10.0.0
 tqdm>=4.66.0
 sentencepiece>=0.2.0
+protobuf>=3.20.0
+tiktoken>=0.6.0
+huggingface-hub>=0.22.0

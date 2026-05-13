@@ -15,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 from peft import PeftModel
 from PIL import Image
 from pydantic import BaseModel
+from transformers import T5Tokenizer
 
 # Suppress the Windows symlinks warning (cosmetic, no impact on functionality)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -26,7 +27,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype  = torch.float16 if device == "cuda" else torch.float32
 print(f"Device: {device}")
 
-# ── Stable Diffusion 1.5 + LoRA ──────────────────────────────────────────────
+# modelo 1: Stable difussion v1.5 + LoRA
 SD_MODEL_ID = "runwayml/stable-diffusion-v1-5"
 SD_LORA_DIR = "lora_model"
 
@@ -54,7 +55,7 @@ else:
 print("[SD] Pipeline listo.")
 
 
-# ── PixArt-alpha DiT + LoRA (lazy: se carga en el primer request) ─────────────
+# Segundo modelo: PixArt-alpha DiT + LoRA
 PIXART_MODEL_ID = "PixArt-alpha/PixArt-XL-2-512x512"
 PIXART_LORA_DIR = "pixart_lora/lora_transformer"
 pipe_pixart = None   # se inicializa al primer uso
@@ -67,8 +68,11 @@ def _load_pixart():
         return
     _pixart_loading = True
     print("[PixArt] Cargando pipeline (primera vez, puede tardar)...")
+    # use_fast=False evita la conversión slow→fast que falla sin sentencepiece
+    tokenizer = T5Tokenizer.from_pretrained(PIXART_MODEL_ID, subfolder="tokenizer", use_fast=False)
     pipe = PixArtAlphaPipeline.from_pretrained(
         PIXART_MODEL_ID,
+        tokenizer=tokenizer,
         torch_dtype=dtype,
     )
     if os.path.exists(PIXART_LORA_DIR):
